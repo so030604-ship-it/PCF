@@ -500,7 +500,47 @@ function notifyServiceServerSimulated(payload) {
   console.log('[PCF] ===========================================\n');
 }
 
-// 서버 실행
+
+
+// ------------------------------
+// 🔍 디버그용 조회 API
+// ------------------------------
+
+// 1) 도메인 목록 조회
+app.get('/debug/domains', (req, res) => {
+    return res.json({
+      count: domains.size,
+      data: Array.from(domains.values())
+    });
+  });
+  
+  // 2) 로그인 이벤트 목록 조회
+  app.get('/debug/login_events', (req, res) => {
+    return res.json({
+      count: loginEvents.size,
+      data: Array.from(loginEvents.values())
+    });
+  });
+  
+  // 3) 샌드박스 리포트 목록 조회
+  app.get('/debug/sandbox_reports', (req, res) => {
+    return res.json({
+      count: sandboxReports.size,
+      data: Array.from(sandboxReports.values())
+    });
+  });
+  
+  // 4) 디바이스 핑거프린트 목록 조회
+  app.get('/debug/device_fp', (req, res) => {
+    return res.json({
+      count: deviceFingerprints.size,
+      data: Array.from(deviceFingerprints.values())
+    });
+  });
+
+  // 서버 실행
 app.listen(PORT, () => {
-  console.log(`PCF backend listening on http://localhost:${PORT}`);
-});
+    console.log(`PCF backend listening on http://localhost:${PORT}`);
+  });
+  
+  
