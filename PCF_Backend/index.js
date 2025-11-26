@@ -23,7 +23,7 @@ let nextDomainId = 1;
 // key: domain_name, value: { id, domain_name, domain_salt, created_at }
 const domains = new Map();
 
-// key: login_event_id, value: { id, user_token, domain_id, login_ip, login_type, created_at }
+// key: login_event_id, value: { id, user_token, domain_id, login_ip, created_at }
 const loginEvents = new Map();
 
 // key: `${domain_id}:${user_token}:${safe_fp}`, value: { id, domain_id, user_token, safe_fp, first_seen_at, last_seen_at }
@@ -61,7 +61,7 @@ function getOrCreateDomain(domainName) {
  *  - PCF가 login_event_id + domain_salt + run_sandbox 플래그 응답
  */
 app.post('/evaluate_login', (req, res) => {
-  const { user_token, domain, login_ip, login_type } = req.body || {};
+  const { user_token, domain, login_ip } = req.body || {};
 
   // 필수값 체크
   if (!user_token || !domain) {
@@ -83,7 +83,6 @@ app.post('/evaluate_login', (req, res) => {
     user_token,
     domain_id: domainRecord.id,
     login_ip: login_ip || null,
-    login_type: login_type || null,
     created_at: now,
   });
 
@@ -189,9 +188,17 @@ app.post('/report_fp', (req, res) => {
 
   sandboxReports.set(login_event_id, report);
 
+  // 4-1) security_signal 기반 취약점 플래그 요약
+  const vulnFlags = analyzeSecuritySignal(security_signal);
+
   // 5) 이 사용자에 대한 과거 히스토리/속도/IP 정보 계산
   const historyStats = getUserHistoryStats(loginEvent.user_token, domainRecord.id);
-  const velocityStats = getUserLoginVelocity(loginEvent.user_token, domainRecord.id, now, 10); // 최근 10분 기준
+  const velocityStats = getUserLoginVelocity(
+    loginEvent.user_token,
+    domainRecord.id,
+    now,
+    10, // 최근 10분 기준
+  );
   const ipStats = getUserIpStats(loginEvent.user_token, domainRecord.id, loginEvent.login_ip);
 
   // 6) 위험도(risk_score) 계산
@@ -207,6 +214,7 @@ app.post('/report_fp', (req, res) => {
     user_token: loginEvent.user_token,
     domain: domainRecord.domain_name,
     risk_score,
+    security_flags: vulnFlags,
     reason: {
       base: 'local_classification + history + velocity + ip_profile',
       debug: {
@@ -320,6 +328,104 @@ function getUserIpStats(user_token, domain_id, currentIp) {
 }
 
 /**
+ * security_signal을 보고 취약점 플래그 요약
+ * - outdated_browser : 브라우저 메이저 버전이 너무 낮음 (Chrome 전제)
+ * - outdated_os      : 오래된 Windows / macOS 사용
+ * - agent_outdated   : 샌드박스/에이전트 버전이 너무 낮음
+ */
+function analyzeSecuritySignal(security_signal) {
+  if (!security_signal) return {};
+
+  const flags = {
+    outdated_browser: false,
+    outdated_os: false,
+    agent_outdated: false,
+  };
+
+  // -----------------------------
+  // 1) 브라우저 (Chrome 전제)
+  // -----------------------------
+  if (security_signal.browser_major !== undefined) {
+    let chromeMajor = null;
+
+    if (typeof security_signal.browser_major === 'number') {
+      chromeMajor = security_signal.browser_major;
+    } else {
+      // "Chrome 120" 같은 문자열에서 숫자만 뽑기
+      const m = String(security_signal.browser_major).match(/(\d+)/);
+      if (m) chromeMajor = parseInt(m[1], 10);
+    }
+
+    if (typeof chromeMajor === 'number' && !Number.isNaN(chromeMajor)) {
+      // 프로젝트 규칙: Chrome 메이저 버전 < 100 → outdated
+      if (chromeMajor < 100) {
+        flags.outdated_browser = true;
+      }
+    }
+  }
+
+  // -----------------------------
+  // 2) OS (Windows / macOS)
+  // -----------------------------
+  if (security_signal.os_major) {
+    const osStr = String(security_signal.os_major).toLowerCase();
+
+    // 2-1) Windows 계열
+    if (osStr.includes('windows')) {
+      const m = osStr.match(/windows\s+(\d+)/);
+      if (m) {
+        const winVer = parseInt(m[1], 10);
+        // 규칙: Windows 10, 11은 최신 / 그 미만은 구버전
+        if (winVer < 10) {
+          flags.outdated_os = true;
+        }
+      } else {
+        // "xp", "vista", "me" 같이 숫자 안 들어간 표현 처리
+        if (
+          osStr.includes('xp') ||
+          osStr.includes('vista') ||
+          osStr.includes('me') ||
+          osStr.includes('2000') ||
+          osStr.includes('98') ||
+          osStr.includes('95')
+        ) {
+          flags.outdated_os = true;
+        }
+      }
+    }
+
+    // 2-2) macOS / OS X 계열
+    if (osStr.includes('mac os') || osStr.includes('macos') || osStr.includes('os x')) {
+      // "macOS 14", "macOS 10.13", "OS X 10.11" 등 처리
+      const m = osStr.match(/(mac\s?os\sx?|macos)\s*(\d+)(?:\.(\d+))?/);
+      if (m) {
+        const major = parseInt(m[2], 10);
+        // 규칙: 10.x 계열은 outdated, 11 이상은 최신
+        if (major < 11) {
+          flags.outdated_os = true;
+        }
+      }
+    }
+  }
+
+  // -----------------------------
+  // 3) 에이전트 버전 (security_version)
+  // -----------------------------
+  const ver = security_signal.security_version;
+  if (typeof ver === 'string') {
+    // "v1." 로 시작해야 최신
+    if (!ver.startsWith('v1.')) {
+      flags.agent_outdated = true;
+    }
+  } else {
+    // 버전 정보가 없으면 보수적으로 구버전 취급
+    flags.agent_outdated = true;
+  }
+
+  return flags;
+}
+
+/**
  * local_classification + 사용자 히스토리 + 로그인 속도 + IP 일관성을
  * 모두 고려해서 0~1 사이 risk_score 산출
  */
@@ -398,5 +504,3 @@ function notifyServiceServerSimulated(payload) {
 app.listen(PORT, () => {
   console.log(`PCF backend listening on http://localhost:${PORT}`);
 });
-
-
