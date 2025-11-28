@@ -2,6 +2,7 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const geoip = require('geoip-lite'); // 🔹 국가 판별용
 
 const app = express();
 const PORT = 3000;
@@ -23,7 +24,7 @@ let nextDomainId = 1;
 // key: domain_name, value: { id, domain_name, domain_salt, created_at }
 const domains = new Map();
 
-// key: login_event_id, value: { id, user_token, domain_id, login_ip, created_at }
+// key: login_event_id, value: { id, user_token, domain_id, login_ip, country, created_at }
 const loginEvents = new Map();
 
 // key: `${domain_id}:${user_token}:${safe_fp}`, value: { id, domain_id, user_token, safe_fp, first_seen_at, last_seen_at }
@@ -77,12 +78,22 @@ app.post('/evaluate_login', (req, res) => {
   const login_event_id = generateId();
   const now = new Date().toISOString();
 
+  // 🔹 2-1) IP 기반 국가 추출 (없으면 null)
+  let country = null;
+  if (login_ip) {
+    const geo = geoip.lookup(login_ip);
+    if (geo && geo.country) {
+      country = geo.country; // 예: "KR", "US"
+    }
+  }
+
   // 3) loginEvents에 저장
   loginEvents.set(login_event_id, {
     id: login_event_id,
     user_token,
     domain_id: domainRecord.id,
     login_ip: login_ip || null,
+    country: country || null, // 🔹 국가 정보 추가
     created_at: now,
   });
 
@@ -199,13 +210,33 @@ app.post('/report_fp', (req, res) => {
     now,
     10, // 최근 10분 기준
   );
-  const ipStats = getUserIpStats(loginEvent.user_token, domainRecord.id, loginEvent.login_ip);
+  const ipStats = getUserIpStats(
+    loginEvent.user_token,
+    domainRecord.id,
+    loginEvent.login_ip
+  );
+
+  // 🔹 5-1) 같은 디바이스(safe_fp)에서 여러 계정 시도 여부
+  const multiFpStats = getFpMultiAccountStats(
+    domainRecord.id,
+    safe_fp,
+    loginEvent.user_token
+  );
+
+  // 🔹 5-2) 국가/지역 변화 정보
+  const geoStats = getUserCountryStats(
+    loginEvent.user_token,
+    domainRecord.id,
+    loginEvent.country || null
+  );
 
   // 6) 위험도(risk_score) 계산
   const risk_score = calculateRiskScore(local_classification, {
     history: historyStats,
     velocity: velocityStats,
     ip: ipStats,
+    multiFp: multiFpStats, // 🔹 safe_fp 기반 multi-account
+    geo: geoStats,
   });
 
   // 7) 서비스 서버에 보낼 payload 콘솔에 찍기 (실제 HTTP 호출은 나중에)
@@ -216,12 +247,14 @@ app.post('/report_fp', (req, res) => {
     risk_score,
     security_flags: vulnFlags,
     reason: {
-      base: 'local_classification + history + velocity + ip_profile',
+      base: 'local_classification + history + velocity + ip_profile + geo + multi_fp',
       debug: {
         local_classification,
         historyStats,
         velocityStats,
         ipStats,
+        multiFpStats,
+        geoStats,
       },
     },
   };
@@ -231,8 +264,7 @@ app.post('/report_fp', (req, res) => {
   // 8) 클라이언트(브라우저 확장)에게 응답
   return res.json({
     ok: true,
-    message: 'sandbox report stored',
-    risk_score,
+    message: 'sandbox report stored'
   });
 });
 
@@ -324,6 +356,68 @@ function getUserIpStats(user_token, domain_id, currentIp) {
     hasIpHistory: totalLogins > 0,
     sameIpRatio,
     distinctIpCount,
+  };
+}
+
+/**
+ * 같은 디바이스(safe_fp)에서 여러 계정(user_token)으로 시도하는지 여부
+ * - domain_id + safe_fp 기준
+ * - 해당 safe_fp에서 로그인한 서로 다른 user_token 개수
+ */
+function getFpMultiAccountStats(domain_id, safe_fp, currentUserToken) {
+  if (!safe_fp) {
+    return {
+    hasFp: false,
+    distinctUsers: 0,
+    };
+  }
+
+  const userSet = new Set();
+
+  for (const fp of deviceFingerprints.values()) {
+    if (fp.domain_id === domain_id && fp.safe_fp === safe_fp) {
+      userSet.add(fp.user_token);
+    }
+  }
+
+  return {
+    hasFp: true,
+    distinctUsers: userSet.size,
+  };
+}
+
+/**
+ * 국가/지역 히스토리
+ * - 같은 user_token + domain_id 기준
+ * - 과거에 어떤 country에서 로그인했는지
+ * - 이번 country가 "처음 보는 국가"인지 여부
+ */
+function getUserCountryStats(user_token, domain_id, currentCountry) {
+  const countrySet = new Set();
+
+  for (const evt of loginEvents.values()) {
+    if (evt.user_token === user_token && evt.domain_id === domain_id) {
+      if (evt.country) {
+        countrySet.add(evt.country);
+      }
+    }
+  }
+
+  const hasGeoHistory = countrySet.size > 0;
+
+  let isNewCountry = false;
+  if (currentCountry) {
+    if (!countrySet.has(currentCountry) && hasGeoHistory) {
+      // 과거 히스토리가 있는데, 이번 country가 처음 등장
+      isNewCountry = true;
+    }
+  }
+
+  return {
+    hasGeoHistory,
+    currentCountry: currentCountry || null,
+    distinctCountryCount: countrySet.size,
+    isNewCountry,
   };
 }
 
@@ -426,13 +520,16 @@ function analyzeSecuritySignal(security_signal) {
 }
 
 /**
- * local_classification + 사용자 히스토리 + 로그인 속도 + IP 일관성을
- * 모두 고려해서 0~1 사이 risk_score 산출
+ * local_classification + 사용자 히스토리 + 로그인 속도 + IP 일관성 +
+ * 같은 디바이스 multi-account + 국가/지역 변화를 모두 고려해서
+ * 0~1 사이 risk_score 산출
  */
 function calculateRiskScore(localClassification, stats) {
   const history = stats.history || {};
   const velocity = stats.velocity || {};
   const ip = stats.ip || {};
+  const multiFp = stats.multiFp || {};
+  const geo = stats.geo || {};
 
   const is_bot = !!(localClassification && localClassification.is_bot);
   const trust_score =
@@ -480,13 +577,22 @@ function calculateRiskScore(localClassification, stats) {
       // 대부분 같은 IP에서 로그인하면 약간 신뢰도 상승
       score -= 0.05;
     }
-    if (ip.distinctIpCount >= 5) {
-      // 너무 많은 IP에서 로그인하면 의심
-      score += 0.05;
-    }
+    // distinctIpCount 기반 가중치는 설계에 없으므로 없음
   }
 
-  // 5) 0 ~ 1 사이로 클램프
+  // 5) 같은 safe_fp(디바이스)에서 여러 계정(user_token) 시도
+  if (multiFp.hasFp && multiFp.distinctUsers >= 2) {
+    // 같은 디바이스로 여러 계정을 돌림 → multi-account 의심
+    score += 0.2;
+  }
+
+  // 6) 처음 보는 국가/대륙 IP
+  if (geo.isNewCountry) {
+    // 과거와 다른 국가에서 갑자기 로그인 → 위험 증가
+    score += 0.15;
+  }
+
+  // 7) 0 ~ 1 사이로 클램프
   if (score < 0) score = 0;
   if (score > 1) score = 1;
 
@@ -508,39 +614,37 @@ function notifyServiceServerSimulated(payload) {
 
 // 1) 도메인 목록 조회
 app.get('/debug/domains', (req, res) => {
-    return res.json({
-      count: domains.size,
-      data: Array.from(domains.values())
-    });
+  return res.json({
+    count: domains.size,
+    data: Array.from(domains.values())
   });
-  
-  // 2) 로그인 이벤트 목록 조회
-  app.get('/debug/login_events', (req, res) => {
-    return res.json({
-      count: loginEvents.size,
-      data: Array.from(loginEvents.values())
-    });
-  });
-  
-  // 3) 샌드박스 리포트 목록 조회
-  app.get('/debug/sandbox_reports', (req, res) => {
-    return res.json({
-      count: sandboxReports.size,
-      data: Array.from(sandboxReports.values())
-    });
-  });
-  
-  // 4) 디바이스 핑거프린트 목록 조회
-  app.get('/debug/device_fp', (req, res) => {
-    return res.json({
-      count: deviceFingerprints.size,
-      data: Array.from(deviceFingerprints.values())
-    });
-  });
+});
 
-  // 서버 실행
-app.listen(PORT, () => {
-    console.log(`PCF backend listening on http://localhost:${PORT}`);
+// 2) 로그인 이벤트 목록 조회
+app.get('/debug/login_events', (req, res) => {
+  return res.json({
+    count: loginEvents.size,
+    data: Array.from(loginEvents.values())
   });
-  
-  
+});
+
+// 3) 샌드박스 리포트 목록 조회
+app.get('/debug/sandbox_reports', (req, res) => {
+  return res.json({
+    count: sandboxReports.size,
+    data: Array.from(sandboxReports.values())
+  });
+});
+
+// 4) 디바이스 핑거프린트 목록 조회
+app.get('/debug/device_fp', (req, res) => {
+  return res.json({
+    count: deviceFingerprints.size,
+    data: Array.from(deviceFingerprints.values())
+  });
+});
+
+// 서버 실행
+app.listen(PORT, () => {
+  console.log(`PCF backend listening on http://localhost:${PORT}`);
+});
