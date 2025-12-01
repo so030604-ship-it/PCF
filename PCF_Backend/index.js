@@ -106,7 +106,6 @@ app.post('/evaluate_login', (req, res) => {
   return res.json({
     login_event_id,
     run_sandbox: true,
-    domain: domainRecord.domain_name,
     domain_salt: domainRecord.domain_salt,
   });
 });
@@ -124,16 +123,15 @@ app.post('/evaluate_login', (req, res) => {
 app.post('/report_fp', (req, res) => {
   const {
     login_event_id,
-    domain,
     safe_fp,
     security_signal,
     local_classification,
   } = req.body || {};
 
   // 필수값 체크
-  if (!login_event_id || !domain || !safe_fp) {
+  if (!login_event_id || !safe_fp) {
     return res.status(400).json({
-      error: 'login_event_id, domain, safe_fp are required',
+      error: 'login_event_id and safe_fp are required',
     });
   }
 
@@ -145,8 +143,26 @@ app.post('/report_fp', (req, res) => {
     });
   }
 
-  // 2) 도메인 조회/생성 (있어야 domain_id 얻음)
-  const domainRecord = getOrCreateDomain(domain);
+  function getDomainById(domainId) {
+    for (const record of domains.values()) {
+      if (record.id === domainId) {
+        return record;
+      }
+    }
+    return null;
+  }
+
+  // 2) PCF 백엔드 내부에서 domain 찾기 (브라우저는 domain 안 보냄)
+  const domainRecord = getDomainById(loginEvent.domain_id);
+  if (!domainRecord) {
+    console.warn('[PCF] WARNING: domain not found for login_event', {
+      login_event_id,
+      domain_id: loginEvent.domain_id,
+    });
+    return res.status(500).json({
+      error: 'domain not found for login_event',
+    });
+  }
 
   // 도메인 불일치 시 경고 (완전 막지는 않고 로그만)
   if (domainRecord.id !== loginEvent.domain_id) {
@@ -208,7 +224,7 @@ app.post('/report_fp', (req, res) => {
     loginEvent.user_token,
     domainRecord.id,
     now,
-    10, // 최근 10분 기준
+    10, // 최근 10분 기준 (로그인 속도)
   );
   const ipStats = getUserIpStats(
     loginEvent.user_token,
@@ -216,18 +232,19 @@ app.post('/report_fp', (req, res) => {
     loginEvent.login_ip
   );
 
-  // 🔹 5-1) 같은 디바이스(safe_fp)에서 여러 계정 시도 여부
+  // 🔹 5-1) 같은 디바이스(safe_fp)에서 여러 계정 시도 여부 (최근 5분)
   const multiFpStats = getFpMultiAccountStats(
     domainRecord.id,
     safe_fp,
-    loginEvent.user_token
+    now
   );
 
-  // 🔹 5-2) 국가/지역 변화 정보
+  // 🔹 5-2) 국가/지역 변화 정보 (현재 이벤트 제외하고 과거만 봄)
   const geoStats = getUserCountryStats(
     loginEvent.user_token,
     domainRecord.id,
-    loginEvent.country || null
+    loginEvent.country || null,
+    login_event_id            // 🔹 현재 이벤트 id 넘겨주기
   );
 
   // 6) 위험도(risk_score) 계산
@@ -239,7 +256,7 @@ app.post('/report_fp', (req, res) => {
     geo: geoStats,
   });
 
-  // 7) 서비스 서버에 보낼 payload 콘솔에 찍기 (실제 HTTP 호출은 나중에)
+  // 7) 서비스 서버에 보낼 payload 콘솔로 확인하기 (실제 HTTP 호출은 나중에)
   const notifyPayload = {
     login_event_id,
     user_token: loginEvent.user_token,
@@ -362,27 +379,42 @@ function getUserIpStats(user_token, domain_id, currentIp) {
 /**
  * 같은 디바이스(safe_fp)에서 여러 계정(user_token)으로 시도하는지 여부
  * - domain_id + safe_fp 기준
- * - 해당 safe_fp에서 로그인한 서로 다른 user_token 개수
+ * - "최근 5분" 안에 이 safe_fp로 로그인한 서로 다른 user_token 개수
  */
-function getFpMultiAccountStats(domain_id, safe_fp, currentUserToken) {
+function getFpMultiAccountStats(domain_id, safe_fp, nowIso) {
+  const windowMinutes = 5;                // 🔹 multi-account 규칙: 최근 5분
+  const now = new Date(nowIso).getTime();
+  const windowMs = windowMinutes * 60 * 1000;
+
   if (!safe_fp) {
     return {
-    hasFp: false,
-    distinctUsers: 0,
+      hasFp: false,
+      distinctUsers: 0,
+      windowMinutes,
     };
   }
 
   const userSet = new Set();
+  let hasAnyFp = false;
 
   for (const fp of deviceFingerprints.values()) {
     if (fp.domain_id === domain_id && fp.safe_fp === safe_fp) {
-      userSet.add(fp.user_token);
+      hasAnyFp = true;
+
+      if (fp.last_seen_at) {
+        const t = new Date(fp.last_seen_at).getTime();
+        if (!Number.isNaN(t) && now - t <= windowMs) {
+          // 최근 5분 안에 본 적 있는 user_token만 카운트
+          userSet.add(fp.user_token);
+        }
+      }
     }
   }
 
   return {
-    hasFp: true,
-    distinctUsers: userSet.size,
+    hasFp: hasAnyFp,              // 이 safe_fp 히스토리가 있는지 여부
+    distinctUsers: userSet.size,  // 최근 5분 안의 서로 다른 user_token 수
+    windowMinutes,
   };
 }
 
@@ -391,11 +423,15 @@ function getFpMultiAccountStats(domain_id, safe_fp, currentUserToken) {
  * - 같은 user_token + domain_id 기준
  * - 과거에 어떤 country에서 로그인했는지
  * - 이번 country가 "처음 보는 국가"인지 여부
+ *   (이번 login_event_id는 히스토리에서 제외)
  */
-function getUserCountryStats(user_token, domain_id, currentCountry) {
+function getUserCountryStats(user_token, domain_id, currentCountry, currentLoginEventId) {
   const countrySet = new Set();
 
-  for (const evt of loginEvents.values()) {
+  for (const [login_event_id, evt] of loginEvents.entries()) {
+    if (login_event_id === currentLoginEventId) {
+      continue; // 이번 이벤트는 건너뛴다
+    }
     if (evt.user_token === user_token && evt.domain_id === domain_id) {
       if (evt.country) {
         countrySet.add(evt.country);
@@ -406,11 +442,8 @@ function getUserCountryStats(user_token, domain_id, currentCountry) {
   const hasGeoHistory = countrySet.size > 0;
 
   let isNewCountry = false;
-  if (currentCountry) {
-    if (!countrySet.has(currentCountry) && hasGeoHistory) {
-      // 과거 히스토리가 있는데, 이번 country가 처음 등장
-      isNewCountry = true;
-    }
+  if (currentCountry && hasGeoHistory && !countrySet.has(currentCountry)) {
+    isNewCountry = true;
   }
 
   return {
@@ -581,8 +614,8 @@ function calculateRiskScore(localClassification, stats) {
   }
 
   // 5) 같은 safe_fp(디바이스)에서 여러 계정(user_token) 시도
-  if (multiFp.hasFp && multiFp.distinctUsers >= 2) {
-    // 같은 디바이스로 여러 계정을 돌림 → multi-account 의심
+  //    🔹 규칙: 최근 5분 안에 서로 다른 계정 3개 이상이면 위험 증가
+  if (multiFp.hasFp && multiFp.distinctUsers >= 3) {
     score += 0.2;
   }
 
@@ -648,3 +681,4 @@ app.get('/debug/device_fp', (req, res) => {
 app.listen(PORT, () => {
   console.log(`PCF backend listening on http://localhost:${PORT}`);
 });
+
