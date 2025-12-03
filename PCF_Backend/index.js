@@ -59,7 +59,8 @@ function getOrCreateDomain(domainName) {
 /**
  * 2단계: /evaluate_login 구현
  *  - 서비스 서버가 로그인 시점에 호출한다고 가정
- *  - PCF가 login_event_id + domain_salt + run_sandbox 플래그 응답
+ *  - PCF가 login_event_id + domain_salt + run_sandbox 플래그를 "헤더"로 응답
+ *  - 바디에는 민감 정보 넣지 않음 (204 No Content)
  */
 app.post('/evaluate_login', (req, res) => {
   const { user_token, domain, login_ip } = req.body || {};
@@ -99,15 +100,16 @@ app.post('/evaluate_login', (req, res) => {
 
   console.log('[PCF] new login_event:', loginEvents.get(login_event_id));
 
-  // 4) 헤더에 X-PCF-Run-Sandbox: 1 세팅
+  // 4) 헤더에 PCF 컨텍스트 전부 세팅
+  //    - X-PCF-Run-Sandbox    : 샌드박스 실행 여부 (여기서는 항상 1)
+  //    - X-PCF-Login-Event-ID : login_event_id
+  //    - X-PCF-Domain-Salt    : 도메인별 salt
   res.set('X-PCF-Run-Sandbox', '1');
+  res.set('X-PCF-Login-Event-ID', login_event_id);
+  res.set('X-PCF-Domain-Salt', domainRecord.domain_salt);
 
-  // 5) JSON 응답 (브라우저/확장용)
-  return res.json({
-    login_event_id,
-    run_sandbox: true,
-    domain_salt: domainRecord.domain_salt,
-  });
+  // 5) 바디에는 아무 민감 정보도 넣지 않음 (204 No Content)
+  return res.status(204).send();
 });
 
 /**
@@ -509,7 +511,7 @@ function analyzeSecuritySignal(security_signal) {
       } else {
         // "xp", "vista", "me" 같이 숫자 안 들어간 표현 처리
         if (
-          osStr.includes('xp') ||
+         osStr.includes('xp') ||
           osStr.includes('vista') ||
           osStr.includes('me') ||
           osStr.includes('2000') ||
@@ -681,4 +683,3 @@ app.get('/debug/device_fp', (req, res) => {
 app.listen(PORT, () => {
   console.log(`PCF backend listening on http://localhost:${PORT}`);
 });
-
