@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "PCF Sandbox Extension",
+  "version": "1.0.0",
+  "description": "PCF 샌드박스 확장: 사이트에서 받은 PCF_CONTEXT 기반으로 fingerprint를 수집하고 PCF 백엔드에 보고합니다.",
+
+  "permissions": [
+    "storage",
+    "webRequest",
+    "webRequestBlocking"
+  ],
+
+  "host_permissions": [
+    "http://localhost:3000/*",
+    "http://localhost:4000/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+
+  "action": {
+    "default_title": "PCF Sandbox Extension"
+  }
+}
